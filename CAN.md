@@ -1,3 +1,507 @@
+# FDCANManager 完整指南
+
+## 📋 FDCANManager 是什么？
+
+FDCANManager 是一个**企业级的 CAN 总线驱动库**，用于：
+- 管理 **FDCAN (CAN FD)** 硬件通信
+- 自动处理 **接收中断、DMA、队列**
+- 提供 **过滤器和回调机制** 路由数据
+- 使用 **FreeRTOS** 实现高效的多任务通信
+
+---
+
+## 🏗️ 核心架构
+
+### **三层设计**
+
+```
+┌─────────────────────────────────────┐
+│        用户代码 (UserTask.cpp)       │
+│   - transmit()    (发送)             │
+│   - callbacks()   (接收)             │
+└────────────┬──────────────────────────┘
+             │
+┌────────────▼──────────────────────────┐
+│       FDCANManager 驱动层             │
+├─────────────────────────────────────┤
+│  RX Task        TX Task        Queue │
+│  (接收任务)     (发送任务)     (缓存)│
+│                                     │
+│  Callbacks      Filters             │
+│  (数据路由)     (ID过滤)            │
+└────────────┬──────────────────────────┘
+             │
+┌────────────▼──────────────────────────┐
+│     FDCAN 硬件 (STM32 硬件)         │
+│   中断、DMA、FIFO 队列              │
+└─────────────────────────────────────┘
+```
+
+---
+
+## 🔄 数据流
+
+### **接收流程**
+
+```
+硬件 FDCAN 接收数据包 (8字节)
+    ↓ (FDCAN_RX_FIFO0/1 有数据)
+硬件中断 (rxFifoCallback)
+    ↓
+唤醒 RX Task (Task Notification)
+    ↓
+RX Task 执行:
+    ├─ 循环读取 FIFO0
+    ├─ 循环读取 FIFO1
+    ├─ 获取 rxHeader.FilterIndex
+    ├─ 查找对应的回调函数
+    └─ 调用回调: callback(data, id, canIndex)
+    ↓
+你的回调函数处理数据
+```
+
+### **发送流程**
+
+```
+调用 transmit(header, data)
+    ↓
+检查硬件 FIFO 状态:
+    │
+    ├─ 有空间 → 直接发送 (快速路径)
+    │         ↓
+    │         硬件立即发送
+    │
+    └─ 满了 → 加入 FreeRTOS Queue
+              ↓
+              TX Task 从 Queue 取数据
+              ↓
+              硬件有空间时发送
+```
+
+---
+
+## 🎯 基本使用步骤
+
+### **步骤 1: 初始化**
+
+```cpp
+#include "FDCANManager.hpp"
+
+Core::Drivers::CANManager canManager;
+
+void startUserTasks()
+{
+    // 初始化 CAN (必须在使用前调用)
+    canManager.init(&hfdcan1);  // hfdcan1 由 STM32CubeMX 生成
+}
+```
+
+**关键点：**
+- `hfdcan1` 是 STM32CubeMX 生成的 FDCAN 句柄
+- 只需调用一次
+- 会自动创建 RX/TX Task 和 Queue
+
+---
+
+### **步骤 2: 创建过滤器**
+
+过滤器决定哪些 CAN ID 的数据会被接收和路由到你的回调函数。
+
+#### **过滤器类型**
+
+**A. MASK 模式（掩码）- 推荐用于单个或少量ID**
+
+```cpp
+// 只接收 ID 0x201 的数据
+CAN_FILTER_T filter = CANManager::getFilter(
+    0x7FF,                              // FilterID2: Mask (掩码)
+    0x201,                              // FilterID1: ID (要接收的ID)
+    CANManager::FilterType::MASK,       // 掩码模式
+    CANManager::FilterConfig::FIFO0     // 存储到 FIFO0
+);
+
+// 工作原理:
+//   接收的ID & Mask == 要求的ID
+//   0x201 & 0x7FF = 0x201  ✓ 匹配
+//   0x202 & 0x7FF = 0x202  ✗ 不匹配
+//   0x200 & 0x7FF = 0x200  ✗ 不匹配
+```
+
+**B. RANGE 模式（范围）- 用于连续ID段**
+
+```cpp
+// 接收 0x200~0x20F 范围内的所有ID
+CAN_FILTER_T filter = CANManager::getFilter(
+    0x20F,                              // FilterID2: End ID (结束)
+    0x200,                              // FilterID1: Start ID (起始)
+    CANManager::FilterType::RANGE,      // 范围模式
+    CANManager::FilterConfig::FIFO0
+);
+
+// 工作原理:
+//   0x200 <= ID <= 0x20F
+//   0x201 ✓  0x20A ✓  0x20F ✓
+//   0x1FF ✗  0x210 ✗
+```
+
+#### **FIFO 选择**
+
+```cpp
+CANManager::FilterConfig::FIFO0  // FIFO 队列 0
+CANManager::FilterConfig::FIFO1  // FIFO 队列 1
+
+// 通常都用 FIFO0，除非需要优先级隔离
+```
+
+---
+
+### **步骤 3: 定义接收回调**
+
+回调函数在 RX Task 中调用，有充足的处理时间。
+
+```cpp
+// 定义回调函数类型
+void motorFeedbackCallback(
+    const uint8_t *rxBuffer,    // 接收的 8 字节数据
+    const uint16_t id,          // CAN ID (0x200-0xFFFF)
+    const uint8_t canIndex      // CAN 编号 (0=FDCAN1, 1=FDCAN2...)
+)
+{
+    // 例：解析电机数据
+    // 通常数据格式为大端序 (Big Endian)
+    
+    uint16_t angle = (rxBuffer[0] << 8) | rxBuffer[1];
+    int16_t speed = (int16_t)((rxBuffer[2] << 8) | rxBuffer[3]);
+    int16_t current = (int16_t)((rxBuffer[4] << 8) | rxBuffer[5]);
+    uint8_t temp = rxBuffer[6];
+    
+    // 保存到全局变量或发送到队列
+    motorData[id - 0x201].angle = angle;
+    motorData[id - 0x201].speed = speed;
+    motorData[id - 0x201].current = current;
+}
+```
+
+---
+
+### **步骤 4: 注册过滤器和回调**
+
+```cpp
+// 创建过滤器
+CAN_FILTER_T filter = CANManager::getFilter(
+    0x7FF, 0x201,
+    CANManager::FilterType::MASK,
+    CANManager::FilterConfig::FIFO0
+);
+
+// 注册：将过滤器和回调绑定
+canManager.registerFilterCallback(filter, motorFeedbackCallback);
+
+// 现在当接收到 ID 0x201 的数据时，会自动调用 motorFeedbackCallback()
+```
+
+**重要：** 最多支持 8 个过滤器 (由 `CAN_FILTER_NUM` 定义)
+
+---
+
+### **步骤 5: 发送数据**
+
+#### **创建 TX Header**
+
+```cpp
+// 创建标准 CAN 帧头 (11位ID, 8字节数据)
+CAN_TXHEADER_T txHeader = CANManager::getTxHeader(0x300);
+
+// 或创建 FDCAN 帧头 (支持不同数据长度)
+// CAN_TXHEADER_T txHeader = CANManager::getTxHeader(
+//     0x300,
+//     CANManager::DataLength::BYTES_8
+// );
+```
+
+#### **准备数据并发送**
+
+```cpp
+uint8_t txData[8] = {
+    0x12, 0x34,           // Bytes 0-1
+    0x56, 0x78,           // Bytes 2-3
+    0xAA, 0xBB,           // Bytes 4-5
+    0xCC, 0xDD            // Bytes 6-7
+};
+
+// 发送 (会自动选择快速路径或加入队列)
+canManager.transmit(txHeader, txData);
+
+// 函数立即返回，数据会被发送 (不阻塞)
+```
+
+---
+
+## 💡 实际例子：电机控制
+
+### **场景：控制 4 个 DJI 电机**
+
+```cpp
+// 1. 定义数据结构
+struct MotorData {
+    uint16_t angle;
+    int16_t speed;
+    int16_t current;
+    uint8_t temperature;
+};
+
+MotorData motors[4];
+
+// 2. 定义接收回调
+void motorFeedbackCallback(const uint8_t *data, const uint16_t id, const uint8_t canIndex)
+{
+    uint8_t motorIdx = id - 0x201;
+    if (motorIdx >= 4) return;
+    
+    motors[motorIdx].angle = (data[0] << 8) | data[1];
+    motors[motorIdx].speed = (int16_t)((data[2] << 8) | data[3]);
+    motors[motorIdx].current = (int16_t)((data[4] << 8) | data[5]);
+    motors[motorIdx].temperature = data[6];
+}
+
+// 3. 初始化
+void setupMotors()
+{
+    canManager.init(&hfdcan1);
+    
+    // 监听 4 个电机的反馈 (ID: 0x201~0x204)
+    CAN_FILTER_T filter = CANManager::getFilter(
+        0x7FF, 0x201,
+        CANManager::FilterType::MASK,
+        CANManager::FilterConfig::FIFO0
+    );
+    canManager.registerFilterCallback(filter, motorFeedbackCallback);
+}
+
+// 4. 发送控制命令
+void sendMotorCommand(uint8_t motorId, int16_t targetCurrent)
+{
+    CAN_TXHEADER_T txHeader = CANManager::getTxHeader(0x200);
+    
+    uint8_t txData[8] = {0};
+    
+    // DJI 电机格式: 每个电流值占 2 字节
+    // 电机 0: Bytes 0-1
+    // 电机 1: Bytes 2-3
+    // 电机 2: Bytes 4-5
+    // 电机 3: Bytes 6-7
+    
+    txData[motorId * 2] = (targetCurrent >> 8) & 0xFF;
+    txData[motorId * 2 + 1] = targetCurrent & 0xFF;
+    
+    canManager.transmit(txHeader, txData);
+}
+
+// 5. 在 Task 中使用
+void motorControlTask(void *pvPara)
+{
+    while (true) {
+        // 读取电机反馈 (由回调自动更新)
+        uint16_t angle = motors[0].angle;
+        int16_t speed = motors[0].speed;
+        
+        // 计算目标电流
+        int16_t targetCurrent = pidController.update(angleError);
+        
+        // 发送给所有电机
+        for (int i = 0; i < 4; i++) {
+            sendMotorCommand(i, targetCurrent);
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+```
+
+---
+
+## 📊 过滤器配置表
+
+| 应用场景 | FilterType | FilterID1 | FilterID2 | 说明 |
+|---------|-----------|----------|----------|------|
+| 单个ID | MASK | 0x201 | 0x7FF | 只接收 0x201 |
+| 多个单独ID | MASK | 各ID | 0x7FF | 需要多个过滤器 |
+| ID 范围 | RANGE | 0x200 | 0x20F | 接收 0x200-0x20F |
+| 所有 ID | MASK | 0x000 | 0x000 | 接收所有ID (不推荐) |
+
+---
+
+## ⚙️ 配置参数
+
+在 `AppConfig.h` 中配置：
+
+```cpp
+#define USE_CAN_MANAGER 1              // 启用 CAN Manager
+
+#if USE_CAN_MANAGER
+    #define CAN_NUM 1                  // CAN 数量 (最多 3: FDCAN1/2/3)
+    #define CAN_FILTER_NUM 8           // 过滤器数量 (最多 8 个)
+    #define CAN_TX_MAX_MESSAGE_NUM_PER_TICK 7  // 每周期最大 TX 消息数
+#endif
+```
+
+---
+
+## 🧪 调试和监控
+
+### **监控发送状态**
+
+```cpp
+// 在 FDCANManager 内部有这些计数器：
+
+volatile uint32_t txCountFifoQ;     // ✅ 成功发送的消息数
+volatile uint32_t txCountFifoQFail; // ❌ 发送失败的消息数
+volatile uint32_t txCountAbortFifoQ;// ⚠️ 丢弃的消息数
+volatile uint8_t qLevel;            // 📊 当前队列深度
+volatile uint32_t busOffCount;      // 🔴 总线离线次数
+
+// 在调试器中监控这些值来评估 CAN 总线健康状况
+```
+
+### **监控接收状态**
+
+```cpp
+volatile uint32_t rxCountTask;      // ✅ 接收处理的消息数
+
+// 正常情况下，rxCountTask 应该稳定增长
+// 如果没有增长，说明没有收到数据
+```
+
+---
+
+## 🚨 常见错误和解决方案
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| 收不到数据 | 过滤器ID设置错误 | 检查 FilterID1 值是否与发送端匹配 |
+| 回调不执行 | 没注册过滤器 | 确保调用 registerFilterCallback() |
+| 发送数据丢失 | TX Queue 满 | 减少发送频率或增加 CAN_TX_QUEUE_LENGTH |
+| 数据错乱 | 字节序错误 | 检查大小端转换 (<<8, >>8) |
+| CAN 总线错误 | 硬件连接问题 | 检查 CAN 线、终端电阻 |
+| 初始化失败 | init() 调用两次 | 只能调用一次，检查代码逻辑 |
+
+---
+
+## 🔍 CAN 数据格式标准
+
+### **大端序 (Big Endian) - DJI 标准**
+
+```cpp
+// 发送 16 位数据: 0x1234
+uint8_t data[2] = {0x12, 0x34};  // 高字节在前
+
+// 接收并解析
+uint16_t value = (data[0] << 8) | data[1];  // 得到 0x1234
+
+// 发送 16 位有符号数: -1000 (0xFC18)
+int16_t value = -1000;
+uint8_t data[2] = {
+    (value >> 8) & 0xFF,  // 高字节
+    value & 0xFF          // 低字节
+};
+
+// 接收
+int16_t received = (int16_t)((data[0] << 8) | data[1]);  // 得到 -1000
+```
+
+### **小端序 (Little Endian) - 某些设备**
+
+```cpp
+// 如果是小端序，字节顺序相反
+uint8_t data[2] = {0x34, 0x12};  // 低字节在前
+uint16_t value = data[0] | (data[1] << 8);  // 得到 0x1234
+```
+
+---
+
+## 📈 性能优化建议
+
+### **1. 任务优先级**
+
+```cpp
+// FDCANManager 创建的任务优先级都是 15 (最高)
+// 这确保 CAN 通信的实时性
+// 你的应用 Task 优先级应该是 1-14
+```
+
+### **2. Stack 大小**
+
+```cpp
+// RX Task: 512 字节  (接收和回调处理)
+// TX Task: 256 字节  (发送处理)
+// 如果回调逻辑复杂，可能需要更大的 stack
+```
+
+### **3. 发送批量数据**
+
+```cpp
+// ❌ 不好：每次发送一个字节
+for (int i = 0; i < 8; i++) {
+    transmit(header, data);  // 调用 8 次
+}
+
+// ✅ 好：一次打包 8 字节
+uint8_t data[8] = {...};
+transmit(header, data);  // 调用 1 次
+```
+
+---
+
+## 📌 关键API总结
+
+```cpp
+// 初始化
+canManager.init(FDCAN_HandleTypeDef *handle);
+
+// 创建过滤器
+CAN_FILTER_T getFilter(
+    uint16_t filterID2, uint16_t filterID1,
+    FilterType type, FilterConfig config
+);
+
+// 注册回调
+canManager.registerFilterCallback(filter, callback);
+
+// 发送数据
+canManager.transmit(txHeader, txData);
+
+// 创建 TX Header
+CAN_TXHEADER_T getTxHeader(uint16_t id);
+CAN_TXHEADER_T getTxHeader(uint16_t id, DataLength len);
+```
+
+---
+
+## ✅ 完整工作流程
+
+```
+1. AppConfig.h 配置
+   ↓
+2. FDCANManager canManager;
+   ↓
+3. canManager.init(&hfdcan1);
+   ↓
+4. 创建过滤器: CAN_FILTER_T filter = getFilter(...);
+   ↓
+5. 注册回调: registerFilterCallback(filter, callback);
+   ↓
+6. 编写回调函数: void callback(data, id, canIndex)
+   ↓
+7. 在 Task 中调用: canManager.transmit(header, data);
+   ↓
+✅ 完成！CAN 通信工作
+```
+
+---
+
+现在你已经掌握了 FDCANManager 的使用！可以参考 `RC_to_Chassis_CAN_Protocol.md` 看实际应用例子。
+
+
 # 遥控 → 底盘 CAN 通信协议
 
 ## 📊 通信架构
